@@ -131,15 +131,20 @@ function sessionCookie(token: string, req: Request): string {
   return parts.join("; ");
 }
 
-function redirectWithoutToken(req: Request, forwardedUrl: URL, token: string): Response {
-  forwardedUrl.searchParams.delete("token");
-  const location = `${forwardedUrl.pathname}${forwardedUrl.search}${forwardedUrl.hash}`;
-  return new Response(null, {
-    status: 302,
-    headers: {
-      Location: location || "/",
-      "Set-Cookie": sessionCookie(token, req),
-    },
+function authenticatedResponse(
+  claimId: string,
+  namespace: string,
+  sandboxPort: string,
+  cookie?: string,
+): Response {
+  const headers = sandboxHeaders(claimId, namespace, sandboxPort);
+  if (cookie) {
+    headers.set("Set-Cookie", cookie);
+  }
+
+  return new Response("OK", {
+    status: 200,
+    headers,
   });
 }
 
@@ -162,7 +167,13 @@ async function handleRequest(req: Request): Promise<Response> {
     if (queryToken) {
       const payload = await verifyAccessToken(queryToken);
       const sessionToken = await createSessionToken(payload);
-      return redirectWithoutToken(req, forwardedUrl, sessionToken);
+      const sandboxPort = forwardedUrl.pathname.startsWith("/files") ? "80" : "4096";
+      return authenticatedResponse(
+        payload.claimId,
+        payload.namespace,
+        sandboxPort,
+        sessionCookie(sessionToken, req),
+      );
     }
 
     const token = parseCookies(req.headers.get("cookie"))[cookieName];
@@ -173,10 +184,7 @@ async function handleRequest(req: Request): Promise<Response> {
     const payload = await verifySessionToken(token);
     const sandboxPort = forwardedUrl.pathname.startsWith("/files") ? "80" : "4096";
 
-    return new Response("OK", {
-      status: 200,
-      headers: sandboxHeaders(payload.claimId, payload.namespace, sandboxPort),
-    });
+    return authenticatedResponse(payload.claimId, payload.namespace, sandboxPort);
   } catch {
     return unauthorized();
   }
