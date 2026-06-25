@@ -49,6 +49,12 @@ function getUrlFromForwardedUri(forwardedUri: string): URL {
   return new URL(forwardedUri, "http://quickstack.local");
 }
 
+function getExternalOrigin(req: Request): string {
+  const proto = req.headers.get("x-forwarded-proto") ?? new URL(req.url).protocol.replace(":", "");
+  const host = req.headers.get("x-forwarded-host") ?? req.headers.get("host") ?? new URL(req.url).host;
+  return `${proto}://${host}`;
+}
+
 function getSessionTtlSeconds(): number {
   return Number(process.env.AGENT_SESSION_JWT_TTL_SECONDS || process.env.AGENT_JWT_TTL_SECONDS || "3600");
 }
@@ -135,16 +141,28 @@ function authenticatedResponse(
   claimId: string,
   namespace: string,
   sandboxPort: string,
-  cookie?: string,
 ): Response {
   const headers = sandboxHeaders(claimId, namespace, sandboxPort);
-  if (cookie) {
-    headers.set("Set-Cookie", cookie);
-  }
 
   return new Response("OK", {
     status: 200,
     headers,
+  });
+}
+
+function redirectWithSessionCookie(req: Request, forwardedUrl: URL, token: string): Response {
+  forwardedUrl.searchParams.delete("token");
+  const location = new URL(
+    `${forwardedUrl.pathname}${forwardedUrl.search}${forwardedUrl.hash}`,
+    getExternalOrigin(req),
+  ).toString();
+
+  return new Response(null, {
+    status: 302,
+    headers: {
+      Location: location,
+      "Set-Cookie": sessionCookie(token, req),
+    },
   });
 }
 
@@ -167,13 +185,7 @@ async function handleRequest(req: Request): Promise<Response> {
     if (queryToken) {
       const payload = await verifyAccessToken(queryToken);
       const sessionToken = await createSessionToken(payload);
-      const sandboxPort = forwardedUrl.pathname.startsWith("/files") ? "80" : "4096";
-      return authenticatedResponse(
-        payload.claimId,
-        payload.namespace,
-        sandboxPort,
-        sessionCookie(sessionToken, req),
-      );
+      return redirectWithSessionCookie(req, forwardedUrl, sessionToken);
     }
 
     const token = parseCookies(req.headers.get("cookie"))[cookieName];
