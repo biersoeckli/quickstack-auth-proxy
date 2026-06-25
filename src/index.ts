@@ -16,14 +16,6 @@ function unauthorized(): Response {
   return new Response("Unauthorized", { status: 401 });
 }
 
-function sandboxHeaders(claimId: string, namespace: string, sandboxPort: string): Headers {
-  return new Headers({
-    "X-Sandbox-ID": claimId,
-    "X-Sandbox-Port": sandboxPort,
-    "X-Sandbox-Namespace": namespace,
-  });
-}
-
 function parseCookies(cookieHeader: string | null): Record<string, string> {
   const cookies: Record<string, string> = {};
   if (!cookieHeader) {
@@ -53,6 +45,10 @@ function getExternalOrigin(req: Request): string {
   const proto = req.headers.get("x-forwarded-proto") ?? new URL(req.url).protocol.replace(":", "");
   const host = req.headers.get("x-forwarded-host") ?? req.headers.get("host") ?? new URL(req.url).host;
   return `${proto}://${host}`;
+}
+
+function getExternalHost(req: Request): string {
+  return req.headers.get("x-forwarded-host") ?? req.headers.get("host") ?? new URL(req.url).host;
 }
 
 function getSessionTtlSeconds(): number {
@@ -137,19 +133,6 @@ function sessionCookie(token: string, req: Request): string {
   return parts.join("; ");
 }
 
-function authenticatedResponse(
-  claimId: string,
-  namespace: string,
-  sandboxPort: string,
-): Response {
-  const headers = sandboxHeaders(claimId, namespace, sandboxPort);
-
-  return new Response("OK", {
-    status: 200,
-    headers,
-  });
-}
-
 function redirectWithSessionCookie(req: Request, forwardedUrl: URL, token: string): Response {
   forwardedUrl.searchParams.delete("token");
   const location = new URL(
@@ -166,15 +149,92 @@ function redirectWithSessionCookie(req: Request, forwardedUrl: URL, token: strin
   });
 }
 
+function sandboxPortFor(forwardedUrl: URL): string {
+  return forwardedUrl.pathname.startsWith("/files") ? "80" : "4096";
+}
+
+function removeAuthProxyCookie(cookieHeader: string | null): string | null {
+  if (!cookieHeader) {
+    return null;
+  }
+
+  const cookies = cookieHeader
+    .split(";")
+    .map((part) => part.trim())
+    .filter((part) => part && !part.startsWith(`${cookieName}=`));
+
+  return cookies.length > 0 ? cookies.join("; ") : null;
+}
+
+function targetUrlFor(forwardedUrl: URL, payload: AgentAccessTokenPayload): string {
+  forwardedUrl.searchParams.delete("token");
+  forwardedUrl.protocol = "http:";
+  forwardedUrl.hostname = `${payload.claimId}.${payload.namespace}.svc.cluster.local`;
+  forwardedUrl.port = sandboxPortFor(forwardedUrl);
+  return forwardedUrl.toString();
+}
+
+function responseHeadersFrom(upstream: Response): Headers {
+  const headers = new Headers();
+  upstream.headers.forEach((value, key) => {
+    if (key.toLowerCase() !== "set-cookie") {
+      headers.set(key, value);
+    }
+  });
+
+  const setCookies = (upstream.headers as any).getSetCookie?.() as string[] | undefined;
+  if (setCookies) {
+    for (const cookie of setCookies) {
+      headers.append("Set-Cookie", cookie);
+    }
+  } else {
+    const cookie = upstream.headers.get("set-cookie");
+    if (cookie) {
+      headers.append("Set-Cookie", cookie);
+    }
+  }
+
+  return headers;
+}
+
+async function proxyToSandbox(req: Request, forwardedUrl: URL, payload: AgentAccessTokenPayload): Promise<Response> {
+  const headers = new Headers(req.headers);
+  headers.delete("host");
+  headers.delete("authorization");
+  headers.delete("x-forwarded-uri");
+
+  const appCookies = removeAuthProxyCookie(req.headers.get("cookie"));
+  if (appCookies) {
+    headers.set("cookie", appCookies);
+  } else {
+    headers.delete("cookie");
+  }
+
+  const init: RequestInit = {
+    method: req.method,
+    headers,
+    redirect: "manual",
+  };
+  if (req.method !== "GET" && req.method !== "HEAD") {
+    init.body = req.body;
+  }
+
+  const upstream = await fetch(targetUrlFor(forwardedUrl, payload), init);
+  return new Response(upstream.body, {
+    status: upstream.status,
+    statusText: upstream.statusText,
+    headers: responseHeadersFrom(upstream),
+  });
+}
+
 async function handleRequest(req: Request): Promise<Response> {
   if (process.env.AUTH_DISABLED === "true") {
-    return new Response("OK", {
-      status: 200,
-      headers: sandboxHeaders(
-        process.env.QS_DEV_CLAIM_ID ?? "dev-claim",
-        process.env.QS_DEV_NAMESPACE ?? "default",
-        process.env.QS_DEV_PORT ?? "4096",
-      ),
+    const forwardedUrl = getUrlFromForwardedUri(getForwardedUri(req));
+    return proxyToSandbox(req, forwardedUrl, {
+      sub: "dev",
+      agentId: "dev-agent",
+      claimId: process.env.QS_DEV_CLAIM_ID ?? "dev-claim",
+      namespace: process.env.QS_DEV_NAMESPACE ?? "default",
     });
   }
 
@@ -194,9 +254,7 @@ async function handleRequest(req: Request): Promise<Response> {
     }
 
     const payload = await verifySessionToken(token);
-    const sandboxPort = forwardedUrl.pathname.startsWith("/files") ? "80" : "4096";
-
-    return authenticatedResponse(payload.claimId, payload.namespace, sandboxPort);
+    return proxyToSandbox(req, forwardedUrl, payload);
   } catch {
     return unauthorized();
   }
