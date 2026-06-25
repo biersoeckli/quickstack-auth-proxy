@@ -34,7 +34,8 @@ function parseCookies(cookieHeader: string | null): Record<string, string> {
 }
 
 function getForwardedUri(req: Request): string {
-  return req.headers.get("x-forwarded-uri") ?? new URL(req.url).pathname;
+  const requestUrl = new URL(req.url);
+  return req.headers.get("x-forwarded-uri") ?? `${requestUrl.pathname}${requestUrl.search}`;
 }
 
 function getUrlFromForwardedUri(forwardedUri: string): URL {
