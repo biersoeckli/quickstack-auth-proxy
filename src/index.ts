@@ -1,4 +1,6 @@
 import { jwtVerify, SignJWT } from "jose";
+import { request as httpRequest } from "node:http";
+import { Readable } from "node:stream";
 
 interface AgentAccessTokenPayload {
   sub: string;
@@ -175,33 +177,11 @@ function targetUrlFor(forwardedUrl: URL, payload: AgentAccessTokenPayload): stri
   return forwardedUrl.toString();
 }
 
-function responseHeadersFrom(upstream: Response): Headers {
-  const headers = new Headers();
-  upstream.headers.forEach((value, key) => {
-    if (key.toLowerCase() !== "set-cookie") {
-      headers.set(key, value);
-    }
-  });
-
-  const setCookies = (upstream.headers as any).getSetCookie?.() as string[] | undefined;
-  if (setCookies) {
-    for (const cookie of setCookies) {
-      headers.append("Set-Cookie", cookie);
-    }
-  } else {
-    const cookie = upstream.headers.get("set-cookie");
-    if (cookie) {
-      headers.append("Set-Cookie", cookie);
-    }
-  }
-
-  return headers;
-}
-
-async function proxyToSandbox(req: Request, forwardedUrl: URL, payload: AgentAccessTokenPayload): Promise<Response> {
+function requestHeadersForSandbox(req: Request): Headers {
   const headers = new Headers(req.headers);
   headers.delete("host");
   headers.delete("authorization");
+  headers.delete("accept-encoding");
   headers.delete("x-forwarded-uri");
 
   const appCookies = removeAuthProxyCookie(req.headers.get("cookie"));
@@ -211,20 +191,78 @@ async function proxyToSandbox(req: Request, forwardedUrl: URL, payload: AgentAcc
     headers.delete("cookie");
   }
 
-  const init: RequestInit = {
-    method: req.method,
-    headers,
-    redirect: "manual",
-  };
-  if (req.method !== "GET" && req.method !== "HEAD") {
-    init.body = req.body;
-  }
+  return headers;
+}
 
-  const upstream = await fetch(targetUrlFor(forwardedUrl, payload), init);
-  return new Response(upstream.body, {
-    status: upstream.status,
-    statusText: upstream.statusText,
-    headers: responseHeadersFrom(upstream),
+function headersToNode(headers: Headers): Record<string, string> {
+  const result: Record<string, string> = {};
+  headers.forEach((value, key) => {
+    result[key] = value;
+  });
+  return result;
+}
+
+function rawResponseHeaders(rawHeaders: string[]): Headers {
+  const headers = new Headers();
+  const excludedHeaders = new Set([
+    "connection",
+    "content-encoding",
+    "content-length",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+  ]);
+
+  for (let i = 0; i < rawHeaders.length; i += 2) {
+    const key = rawHeaders[i];
+    const value = rawHeaders[i + 1];
+    if (!key || value === undefined) {
+      continue;
+    }
+    const lowerKey = key.toLowerCase();
+    if (excludedHeaders.has(lowerKey)) {
+      continue;
+    }
+    if (lowerKey === "set-cookie") {
+      headers.append(key, value);
+    } else if (!headers.has(key)) {
+      headers.set(key, value);
+    }
+  }
+  return headers;
+}
+
+async function proxyToSandbox(req: Request, forwardedUrl: URL, payload: AgentAccessTokenPayload): Promise<Response> {
+  const targetUrl = new URL(targetUrlFor(forwardedUrl, payload));
+  const headers = requestHeadersForSandbox(req);
+
+  return await new Promise<Response>((resolve, reject) => {
+    const upstreamReq = httpRequest({
+      protocol: targetUrl.protocol,
+      hostname: targetUrl.hostname,
+      port: targetUrl.port,
+      path: `${targetUrl.pathname}${targetUrl.search}`,
+      method: req.method,
+      headers: headersToNode(headers),
+    }, (upstreamRes) => {
+      resolve(new Response(Readable.toWeb(upstreamRes) as ReadableStream, {
+        status: upstreamRes.statusCode ?? 502,
+        statusText: upstreamRes.statusMessage,
+        headers: rawResponseHeaders(upstreamRes.rawHeaders),
+      }));
+    });
+
+    upstreamReq.on("error", reject);
+
+    if (req.body && req.method !== "GET" && req.method !== "HEAD") {
+      Readable.fromWeb(req.body as any).pipe(upstreamReq);
+    } else {
+      upstreamReq.end();
+    }
   });
 }
 
