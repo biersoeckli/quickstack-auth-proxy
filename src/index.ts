@@ -395,56 +395,63 @@ const bunServer = (globalThis as any).Bun.serve({
   websocket: {
     open(ws: any) {
       const data = ws.data as ProxyWebSocketData;
-
-      let protocols: string[] | undefined;
-      if (data.protocol) {
-        protocols = [data.protocol];
-      }
-
-      console.log(`[ws-proxy] connecting upstream → ${data.targetUrl}`);
-
-      const upstream = new (WebSocket as any)(data.targetUrl, protocols, {
-        headers: data.headers,
-      }) as WebSocket;
-
-      data.upstream = upstream;
-
       let closed = false;
 
-      const closeBoth = () => {
+      const closeBoth = (code?: number, reason?: string) => {
         if (closed) return;
         closed = true;
-        try { ws.close(); } catch { /* ignore */ }
+        try { ws.close(code, reason); } catch { /* ignore */ }
       };
 
+      // Connection timeout: if upstream doesn't connect within 10s, abort
+      const timeout = setTimeout(() => {
+        console.error(`[ws-proxy] upstream connection timeout for ${data.targetUrl}`);
+        closeBoth(1011, "Upstream connection timeout");
+      }, 10_000);
+
+      // Bun's WebSocket constructor takes (url, options) — NOT (url, protocols, options)
+      // Pass headers as part of the options object (second argument).
+      const upstreamOptions: any = { headers: data.headers };
+      const upstream = new (WebSocket as any)(data.targetUrl, upstreamOptions) as WebSocket;
+      data.upstream = upstream;
+
       upstream.onopen = () => {
-        console.log(`[ws-proxy] upstream connected → ${data.targetUrl}`);
-        // Flush queued messages that arrived before upstream was ready
+        clearTimeout(timeout);
+        console.error(`[ws-proxy] upstream connected → ${data.targetUrl} (had ${data.pending.length} pending)`);
         for (const msg of data.pending) {
-          upstream.send(msg);
+          if (upstream.readyState === WebSocket.OPEN) {
+            upstream.send(msg);
+          }
         }
         data.pending = [];
       };
 
       upstream.onmessage = (event: MessageEvent) => {
         if (closed) return;
-        ws.send(event.data);
+        if (event.data instanceof ArrayBuffer) {
+          ws.send(new Uint8Array(event.data));
+        } else if (event.data instanceof Blob) {
+          // Bun may deliver Blob for text; convert
+          event.data.arrayBuffer().then((buf: ArrayBuffer) => {
+            if (!closed) ws.send(new Uint8Array(buf));
+          }).catch(() => {});
+        } else {
+          ws.send(event.data as any);
+        }
       };
 
       upstream.onclose = (event: CloseEvent) => {
+        clearTimeout(timeout);
         if (closed) return;
         closed = true;
-        console.log(
-          `[ws-proxy] upstream closed code=${event.code} reason="${event.reason}"`,
-        );
+        console.error(`[ws-proxy] upstream closed code=${event.code} reason="${event.reason}" url=${data.targetUrl}`);
         ws.close(event.code || 1000, event.reason || "Upstream closed");
       };
 
-      upstream.onerror = () => {
-        console.error(
-          `[ws-proxy] upstream error for ${data.targetUrl}`,
-        );
-        closeBoth();
+      upstream.onerror = (event: Event) => {
+        clearTimeout(timeout);
+        console.error(`[ws-proxy] upstream error for ${data.targetUrl}`);
+        closeBoth(1011, "Upstream websocket error");
       };
     },
     message(ws: any, message: string | Uint8Array) {
