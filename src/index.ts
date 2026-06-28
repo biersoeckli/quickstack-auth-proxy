@@ -19,6 +19,7 @@ interface ProxyWebSocketData {
   headers: Record<string, string>;
   protocol: string | null;
   upstream: WebSocket | null;
+  pending: (string | Uint8Array)[];
 }
 
 function unauthorized(): Response {
@@ -256,6 +257,7 @@ function proxyWebSocketToSandbox(
       headers,
       protocol,
       upstream: null,
+      pending: [],
     } satisfies ProxyWebSocketData,
   });
 
@@ -399,6 +401,8 @@ const bunServer = (globalThis as any).Bun.serve({
         protocols = [data.protocol];
       }
 
+      console.log(`[ws-proxy] connecting upstream → ${data.targetUrl}`);
+
       const upstream = new (WebSocket as any)(data.targetUrl, protocols, {
         headers: data.headers,
       }) as WebSocket;
@@ -414,7 +418,12 @@ const bunServer = (globalThis as any).Bun.serve({
       };
 
       upstream.onopen = () => {
-        // Connection established – ready to relay
+        console.log(`[ws-proxy] upstream connected → ${data.targetUrl}`);
+        // Flush queued messages that arrived before upstream was ready
+        for (const msg of data.pending) {
+          upstream.send(msg);
+        }
+        data.pending = [];
       };
 
       upstream.onmessage = (event: MessageEvent) => {
@@ -425,6 +434,9 @@ const bunServer = (globalThis as any).Bun.serve({
       upstream.onclose = (event: CloseEvent) => {
         if (closed) return;
         closed = true;
+        console.log(
+          `[ws-proxy] upstream closed code=${event.code} reason="${event.reason}"`,
+        );
         ws.close(event.code || 1000, event.reason || "Upstream closed");
       };
 
@@ -436,17 +448,30 @@ const bunServer = (globalThis as any).Bun.serve({
       };
     },
     message(ws: any, message: string | Uint8Array) {
-      const upstream = (ws.data as ProxyWebSocketData).upstream;
-      if (!upstream || upstream.readyState !== WebSocket.OPEN) return;
+      const data = ws.data as ProxyWebSocketData;
+      const upstream = data.upstream;
 
-      if (typeof message === "string") {
-        upstream.send(message);
-      } else if (message instanceof Uint8Array) {
-        upstream.send(message);
-      } else {
-        // Fallback: coerce ArrayBufferView to Uint8Array
-        upstream.send(new Uint8Array((message as any).buffer ?? message));
+      if (!upstream) return;
+
+      if (upstream.readyState === WebSocket.OPEN) {
+        // Flush any pending messages first (shouldn't happen, but safe)
+        for (const msg of data.pending) {
+          upstream.send(msg);
+        }
+        data.pending = [];
+
+        if (typeof message === "string") {
+          upstream.send(message);
+        } else if (message instanceof Uint8Array) {
+          upstream.send(message);
+        } else {
+          upstream.send(new Uint8Array((message as any).buffer ?? message));
+        }
+      } else if (upstream.readyState === WebSocket.CONNECTING) {
+        // Upstream not ready yet; queue the message
+        data.pending.push(typeof message === "string" ? message : new Uint8Array(message));
       }
+      // If CLOSING or CLOSED, drop the message
     },
     close(ws: any) {
       const upstream = (ws.data as ProxyWebSocketData).upstream;
