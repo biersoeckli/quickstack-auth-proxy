@@ -238,7 +238,7 @@ function proxyWebSocketToSandbox(
   server: any,
   forwardedUrl: URL,
   payload: AgentAccessTokenPayload,
-): Response {
+): Response | undefined {
   const targetUrl = webSocketTargetUrlFor(forwardedUrl, payload);
   const { headers, protocol } = webSocketHeadersForSandbox(req);
 
@@ -258,10 +258,13 @@ function proxyWebSocketToSandbox(
   });
 
   if (!upgraded) {
+    console.error("[ws-proxy] upgrade failed: server.upgrade() returned false");
     return new Response("Bad Gateway", { status: 502 });
   }
 
-  return new Response(null, { status: 101 });
+  // Bun has already sent 101 Switching Protocols; return undefined so the fetch
+  // handler yields control to the websocket handlers.
+  return undefined;
 }
 
 function headersToNode(headers: Headers): Record<string, string> {
@@ -335,7 +338,7 @@ async function proxyToSandbox(req: Request, forwardedUrl: URL, payload: AgentAcc
   });
 }
 
-async function handleRequest(req: Request, server: any): Promise<Response> {
+async function handleRequest(req: Request, server: any): Promise<Response | undefined> {
   if (process.env.AUTH_DISABLED === "true") {
     const forwardedUrl = getUrlFromForwardedUri(getForwardedUri(req));
     if (isWebSocketUpgrade(req)) {
@@ -388,41 +391,66 @@ const bunServer = (globalThis as any).Bun.serve({
   websocket: {
     open(ws: any) {
       const data = ws.data as ProxyWebSocketData;
-      const upstream = new (WebSocket as any)(
-        data.targetUrl,
-        data.protocol ? [data.protocol] : undefined,
-        { headers: data.headers },
-      ) as WebSocket;
+
+      let protocols: string[] | undefined;
+      if (data.protocol) {
+        protocols = [data.protocol];
+      }
+
+      const upstream = new (WebSocket as any)(data.targetUrl, protocols, {
+        headers: data.headers,
+      }) as WebSocket;
 
       data.upstream = upstream;
 
-      upstream.binaryType = "arraybuffer";
+      let closed = false;
 
-      upstream.onmessage = (event) => {
+      const closeBoth = () => {
+        if (closed) return;
+        closed = true;
+        try { ws.close(); } catch { /* ignore */ }
+      };
+
+      upstream.onopen = () => {
+        // Connection established – ready to relay
+      };
+
+      upstream.onmessage = (event: MessageEvent) => {
+        if (closed) return;
         ws.send(event.data);
       };
 
-      upstream.onclose = () => {
-        ws.close();
+      upstream.onclose = (event: CloseEvent) => {
+        if (closed) return;
+        closed = true;
+        ws.close(event.code || 1000, event.reason || "Upstream closed");
       };
 
       upstream.onerror = () => {
-        ws.close(1011, "Upstream websocket error");
+        console.error(
+          `[ws-proxy] upstream error for ${data.targetUrl}`,
+        );
+        closeBoth();
       };
     },
     message(ws: any, message: string | Uint8Array) {
       const upstream = (ws.data as ProxyWebSocketData).upstream;
-      if (upstream && upstream.readyState === WebSocket.OPEN) {
-        if (typeof message === "string") {
-          upstream.send(message);
-        } else {
-          upstream.send(new Uint8Array(message));
-        }
+      if (!upstream || upstream.readyState !== WebSocket.OPEN) return;
+
+      if (typeof message === "string") {
+        upstream.send(message);
+      } else if (message instanceof Uint8Array) {
+        upstream.send(message);
+      } else {
+        // Fallback: coerce ArrayBufferView to Uint8Array
+        upstream.send(new Uint8Array((message as any).buffer ?? message));
       }
     },
     close(ws: any) {
       const upstream = (ws.data as ProxyWebSocketData).upstream;
-      if (upstream && upstream.readyState === WebSocket.OPEN) {
+      if (!upstream) return;
+
+      if (upstream.readyState === WebSocket.OPEN) {
         upstream.close();
       }
     },
