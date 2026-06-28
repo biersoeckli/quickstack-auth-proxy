@@ -190,6 +190,8 @@ function requestHeadersForSandbox(req: Request): Headers {
   headers.delete("authorization");
   headers.delete("accept-encoding");
   headers.delete("x-forwarded-uri");
+  headers.delete("origin");
+  headers.delete("referer");
 
   const appCookies = removeAuthProxyCookie(req.headers.get("cookie"));
   if (appCookies) {
