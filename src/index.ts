@@ -14,6 +14,13 @@ const issuer = "quickstack-auth-proxy";
 const cookieName = "qs-auth-proxy-session";
 const sessionSecret = crypto.getRandomValues(new Uint8Array(32));
 
+interface ProxyWebSocketData {
+  targetUrl: string;
+  headers: Record<string, string>;
+  protocol: string | null;
+  upstream: WebSocket | null;
+}
+
 function unauthorized(): Response {
   return new Response("Unauthorized", { status: 401 });
 }
@@ -194,6 +201,69 @@ function requestHeadersForSandbox(req: Request): Headers {
   return headers;
 }
 
+function webSocketHeadersForSandbox(req: Request): { headers: Record<string, string>; protocol: string | null } {
+  const headers = requestHeadersForSandbox(req);
+
+  headers.delete("connection");
+  headers.delete("upgrade");
+  headers.delete("sec-websocket-key");
+  headers.delete("sec-websocket-version");
+  headers.delete("sec-websocket-extensions");
+
+  const protocolHeader = req.headers.get("sec-websocket-protocol");
+  const protocol = protocolHeader ? protocolHeader.split(",")[0]?.trim() ?? null : null;
+
+  if (protocolHeader) {
+    headers.delete("sec-websocket-protocol");
+  }
+
+  return {
+    headers: headersToNode(headers),
+    protocol,
+  };
+}
+
+function isWebSocketUpgrade(req: Request): boolean {
+  return req.headers.get("upgrade")?.toLowerCase() === "websocket";
+}
+
+function webSocketTargetUrlFor(forwardedUrl: URL, payload: AgentAccessTokenPayload): string {
+  const target = new URL(targetUrlFor(forwardedUrl, payload));
+  target.protocol = "ws:";
+  return target.toString();
+}
+
+function proxyWebSocketToSandbox(
+  req: Request,
+  server: any,
+  forwardedUrl: URL,
+  payload: AgentAccessTokenPayload,
+): Response {
+  const targetUrl = webSocketTargetUrlFor(forwardedUrl, payload);
+  const { headers, protocol } = webSocketHeadersForSandbox(req);
+
+  const upgradeHeaders: Record<string, string> = {};
+  if (protocol) {
+    upgradeHeaders["Sec-WebSocket-Protocol"] = protocol;
+  }
+
+  const upgraded = server?.upgrade(req, {
+    headers: upgradeHeaders,
+    data: {
+      targetUrl,
+      headers,
+      protocol,
+      upstream: null,
+    } satisfies ProxyWebSocketData,
+  });
+
+  if (!upgraded) {
+    return new Response("Bad Gateway", { status: 502 });
+  }
+
+  return new Response(null, { status: 101 });
+}
+
 function headersToNode(headers: Headers): Record<string, string> {
   const result: Record<string, string> = {};
   headers.forEach((value, key) => {
@@ -265,9 +335,18 @@ async function proxyToSandbox(req: Request, forwardedUrl: URL, payload: AgentAcc
   });
 }
 
-async function handleRequest(req: Request): Promise<Response> {
+async function handleRequest(req: Request, server: any): Promise<Response> {
   if (process.env.AUTH_DISABLED === "true") {
     const forwardedUrl = getUrlFromForwardedUri(getForwardedUri(req));
+    if (isWebSocketUpgrade(req)) {
+      return proxyWebSocketToSandbox(req, server, forwardedUrl, {
+        sub: "dev",
+        agentId: "dev-agent",
+        claimId: process.env.QS_DEV_CLAIM_ID ?? "dev-claim",
+        namespace: process.env.QS_DEV_NAMESPACE ?? "default",
+      });
+    }
+
     return proxyToSandbox(req, forwardedUrl, {
       sub: "dev",
       agentId: "dev-agent",
@@ -292,15 +371,62 @@ async function handleRequest(req: Request): Promise<Response> {
     }
 
     const payload = await verifySessionToken(token);
+
+    if (isWebSocketUpgrade(req)) {
+      return proxyWebSocketToSandbox(req, server, forwardedUrl, payload);
+    }
+
     return proxyToSandbox(req, forwardedUrl, payload);
   } catch {
     return unauthorized();
   }
 }
 
-(globalThis as any).Bun.serve({
+const bunServer = (globalThis as any).Bun.serve({
   port,
-  fetch: handleRequest,
+  fetch: (req: Request, server: any) => handleRequest(req, server),
+  websocket: {
+    open(ws: any) {
+      const data = ws.data as ProxyWebSocketData;
+      const upstream = new (WebSocket as any)(
+        data.targetUrl,
+        data.protocol ? [data.protocol] : undefined,
+        { headers: data.headers },
+      ) as WebSocket;
+
+      data.upstream = upstream;
+
+      upstream.binaryType = "arraybuffer";
+
+      upstream.onmessage = (event) => {
+        ws.send(event.data);
+      };
+
+      upstream.onclose = () => {
+        ws.close();
+      };
+
+      upstream.onerror = () => {
+        ws.close(1011, "Upstream websocket error");
+      };
+    },
+    message(ws: any, message: string | Uint8Array) {
+      const upstream = (ws.data as ProxyWebSocketData).upstream;
+      if (upstream && upstream.readyState === WebSocket.OPEN) {
+        if (typeof message === "string") {
+          upstream.send(message);
+        } else {
+          upstream.send(new Uint8Array(message));
+        }
+      }
+    },
+    close(ws: any) {
+      const upstream = (ws.data as ProxyWebSocketData).upstream;
+      if (upstream && upstream.readyState === WebSocket.OPEN) {
+        upstream.close();
+      }
+    },
+  },
 });
 
 console.log(`Agent auth proxy listening on port ${port}`);
